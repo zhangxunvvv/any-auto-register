@@ -32,6 +32,11 @@ from .utils import (
 # Chrome 指纹配置
 _CHROME_PROFILES = [
     {
+        "major": 124, "impersonate": "chrome124",
+        "build": 6367, "patch_range": (60, 210),
+        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not.A/Brand";v="99"',
+    },
+    {
         "major": 131, "impersonate": "chrome131",
         "build": 6778, "patch_range": (69, 205),
         "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
@@ -49,15 +54,25 @@ _CHROME_PROFILES = [
 ]
 
 
-def _random_chrome_version():
-    """随机选择一个 Chrome 版本"""
-    profile = random.choice(_CHROME_PROFILES)
+def _chrome_version_from_profile(profile):
     major = profile["major"]
     build = profile["build"]
     patch = random.randint(*profile["patch_range"])
     full_ver = f"{major}.0.{build}.{patch}"
     ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
     return profile["impersonate"], major, full_ver, ua, profile["sec_ch_ua"]
+
+
+def _random_chrome_version():
+    """随机选择一个 Chrome 版本"""
+    profile = random.choice(_CHROME_PROFILES)
+    return _chrome_version_from_profile(profile)
+
+
+def _stable_proxy_chrome_version():
+    """代理链路优先使用稳定指纹，降低 TLS 连接重置概率。"""
+    profile = next((p for p in _CHROME_PROFILES if p["impersonate"] == "chrome124"), _CHROME_PROFILES[0])
+    return _chrome_version_from_profile(profile)
 
 
 class ChatGPTClient:
@@ -86,8 +101,11 @@ class ChatGPTClient:
             "en-US,en;q=0.8",
         ])
         
-        # 随机 Chrome 版本
-        self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _random_chrome_version()
+        # 代理链路优先固定到更稳定的指纹，减少 TLS 抖动
+        if self.proxy:
+            self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _stable_proxy_chrome_version()
+        else:
+            self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _random_chrome_version()
         
         # 创建 session
         self.session = curl_requests.Session(impersonate=self.impersonate)
@@ -121,6 +139,75 @@ class ChatGPTClient:
         """在 headed 模式下加入轻微停顿，模拟有头浏览器节奏。"""
         if self.browser_mode == "headed":
             random_delay(low, high)
+
+    def _is_retryable_network_error(self, err: Exception) -> bool:
+        text = str(err).lower()
+        keywords = (
+            "curl: (28)",
+            "curl: (35)",
+            "curl: (52)",
+            "curl: (55)",
+            "curl: (56)",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection closed",
+            "connection closed abruptly",
+            "empty reply from server",
+            "recv failure",
+            "send failure",
+            "tls",
+            "ssl",
+            "temporarily unavailable",
+            "proxy connect aborted",
+            "failed sending data to the peer",
+            "failure when receiving data from the peer",
+        )
+        return any(k in text for k in keywords)
+
+    def _request_with_retry(self, method: str, url: str, max_retries: int = 3,
+                            retry_statuses=(429, 500, 502, 503, 504), **kwargs):
+        """统一请求重试：重点覆盖代理链路下的瞬时网络抖动。"""
+        # 代理链路下默认放大重试次数，降低临时网络中断导致的整流程失败概率
+        effective_retries = max(max_retries, 5) if self.proxy else max_retries
+        last_error = None
+
+        req_method = method.upper()
+        for attempt in range(effective_retries):
+            try:
+                request_kwargs = dict(kwargs)
+                if self.proxy:
+                    headers = dict(request_kwargs.get("headers") or {})
+                    # auth.openai.com 在部分代理上对 Connection: close 更敏感，避免在该域强制注入
+                    if (
+                        "Connection" not in headers
+                        and "connection" not in headers
+                        and "auth.openai.com" not in str(url).lower()
+                    ):
+                        headers["Connection"] = "close"
+                    request_kwargs["headers"] = headers
+
+                if attempt > 0:
+                    self._log(f"网络请求重试 {attempt + 1}/{effective_retries}: {req_method} {url}")
+                    sleep_s = min(6.0, 0.8 * (2 ** (attempt - 1)) + random.uniform(0.05, 0.35))
+                    time.sleep(sleep_s)
+
+                response = self.session.request(req_method, url, **request_kwargs)
+                if response.status_code in retry_statuses and attempt < effective_retries - 1:
+                    self._log(f"请求返回 {response.status_code}，准备重试: {url}")
+                    continue
+                return response
+            except Exception as e:
+                last_error = e
+                # 有代理时默认开启网络重试；无代理则仅对典型瞬时网络错误重试
+                should_retry = bool(self.proxy) or self._is_retryable_network_error(e)
+                if should_retry and attempt < effective_retries - 1:
+                    self._log(f"请求异常(可重试): {e}")
+                    continue
+                raise
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"请求失败: {method} {url}")
 
     def _headers(
         self,
@@ -157,7 +244,10 @@ class ChatGPTClient:
     def _reset_session(self):
         """重置浏览器指纹与会话，用于绕过偶发的 Cloudflare/SPA 中间页。"""
         self.device_id = str(uuid.uuid4())
-        self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _random_chrome_version()
+        if self.proxy:
+            self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _stable_proxy_chrome_version()
+        else:
+            self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _random_chrome_version()
         self.accept_language = random.choice([
             "en-US,en;q=0.9",
             "en-US,en;q=0.9,zh-CN;q=0.8",
@@ -181,6 +271,58 @@ class ChatGPTClient:
             "sec-ch-ua-platform-version": f'"{random.randint(10, 15)}.0.0"',
         })
         seed_oai_device_cookie(self.session, self.device_id)
+
+    def _recreate_session_preserve_cookies(self):
+        """保留 Cookie 重建 Session，用于处理 TLS 连接状态污染。"""
+        cookie_snapshot = []
+        try:
+            for cookie in self.session.cookies.jar:
+                cookie_snapshot.append(
+                    {
+                        "name": cookie.name,
+                        "value": cookie.value,
+                        "domain": cookie.domain,
+                        "path": cookie.path,
+                        "secure": bool(cookie.secure),
+                    }
+                )
+        except Exception:
+            cookie_snapshot = []
+
+        old_session = self.session
+        self.session = curl_requests.Session(impersonate=self.impersonate)
+        if self.proxy:
+            self.session.proxies = {"http": self.proxy, "https": self.proxy}
+
+        self.session.headers.update({
+            "User-Agent": self.ua,
+            "Accept-Language": self.accept_language,
+            "sec-ch-ua": self.sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-arch": '"x86"',
+            "sec-ch-ua-bitness": '"64"',
+            "sec-ch-ua-full-version": f'"{self.chrome_full}"',
+            "sec-ch-ua-platform-version": f'"{random.randint(10, 15)}.0.0"',
+        })
+        seed_oai_device_cookie(self.session, self.device_id)
+
+        for ck in cookie_snapshot:
+            try:
+                self.session.cookies.set(
+                    ck["name"],
+                    ck["value"],
+                    domain=ck["domain"],
+                    path=ck["path"],
+                    secure=ck["secure"],
+                )
+            except Exception:
+                continue
+
+        try:
+            old_session.close()
+        except Exception:
+            pass
 
     def _state_from_url(self, url, method="GET"):
         state = extract_flow_state(
@@ -245,7 +387,8 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.get(
+            r = self._request_with_retry(
+                "GET",
                 target_url,
                 headers=self._headers(
                     target_url,
@@ -292,7 +435,8 @@ class ChatGPTClient:
         """请求 ChatGPT Session 接口并返回原始会话数据。"""
         url = f"{self.BASE}/api/auth/session"
         self._browser_pause()
-        response = self.session.get(
+        response = self._request_with_retry(
+            "GET",
             url,
             headers=self._headers(
                 url,
@@ -387,9 +531,15 @@ class ChatGPTClient:
         """访问首页，建立 session"""
         self._log("访问 ChatGPT 首页...")
         url = f"{self.BASE}/"
+
+        def _is_proxy_auth_error(err: Exception) -> bool:
+            text = str(err).lower()
+            return "response 407" in text or "proxy authentication" in text
+
         try:
             self._browser_pause()
-            r = self.session.get(
+            r = self._request_with_retry(
+                "GET",
                 url,
                 headers=self._headers(
                     url,
@@ -402,6 +552,29 @@ class ChatGPTClient:
             return r.status_code == 200
         except Exception as e:
             self._log(f"访问首页失败: {e}")
+            if self.proxy and _is_proxy_auth_error(e):
+                self._log("检测到代理 407（需要认证或认证失败），自动降级为直连并重试")
+                self.proxy = None
+                try:
+                    self.session.proxies = {}
+                except Exception:
+                    pass
+                try:
+                    self._browser_pause()
+                    r = self._request_with_retry(
+                        "GET",
+                        url,
+                        headers=self._headers(
+                            url,
+                            accept="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                            navigation=True,
+                        ),
+                        allow_redirects=True,
+                        timeout=30,
+                    )
+                    return r.status_code == 200
+                except Exception as e2:
+                    self._log(f"直连重试失败: {e2}")
             return False
     
     def get_csrf_token(self):
@@ -409,7 +582,8 @@ class ChatGPTClient:
         self._log("获取 CSRF token...")
         url = f"{self.BASE}/api/auth/csrf"
         try:
-            r = self.session.get(
+            r = self._request_with_retry(
+                "GET",
                 url,
                 headers=self._headers(
                     url,
@@ -457,7 +631,8 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.post(
+            r = self._request_with_retry(
+                "POST",
                 url,
                 params=params,
                 data=form_data,
@@ -469,7 +644,7 @@ class ChatGPTClient:
                     content_type="application/x-www-form-urlencoded",
                     fetch_site="same-origin",
                 ),
-                timeout=30
+                timeout=30,
             )
             
             if r.status_code == 200:
@@ -500,7 +675,8 @@ class ChatGPTClient:
                     self._log("访问 authorize URL...")
 
                 self._browser_pause()
-                r = self.session.get(
+                r = self._request_with_retry(
+                    "GET",
                     url,
                     headers=self._headers(
                         url,
@@ -522,6 +698,11 @@ class ChatGPTClient:
                 
                 if is_tls_error and attempt < max_retries - 1:
                     self._log(f"Authorize TLS 错误 (尝试 {attempt + 1}/{max_retries}): {error_msg[:100]}")
+                    if self.proxy:
+                        # 代理模式下发生 TLS reset 时，保留 Cookie 重建连接，避免复用损坏连接池
+                        if attempt == 0:
+                            self.impersonate, self.chrome_major, self.chrome_full, self.ua, self.sec_ch_ua = _stable_proxy_chrome_version()
+                        self._recreate_session_preserve_cookies()
                     continue
                 else:
                     self._log(f"Authorize 失败: {e}")
@@ -566,7 +747,7 @@ class ChatGPTClient:
         
         try:
             self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            r = self._request_with_retry("POST", url, json=payload, headers=headers, timeout=30)
             
             if r.status_code == 200:
                 data = r.json()
@@ -592,7 +773,8 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.get(
+            r = self._request_with_retry(
+                "GET",
                 url,
                 headers=self._headers(
                     url,
@@ -620,7 +802,7 @@ class ChatGPTClient:
         """
         self._log(f"验证 OTP 码: {otp_code}")
         url = f"{self.AUTH}/api/accounts/email-otp/validate"
-        
+
         headers = self._headers(
             url,
             accept="application/json",
@@ -630,29 +812,59 @@ class ChatGPTClient:
             fetch_site="same-origin",
         )
         headers.update(generate_datadog_trace())
-        
+
         payload = {"code": otp_code}
-        
-        try:
-            self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
-            
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    data = {}
-                next_state = self._state_from_payload(data, current_url=str(r.url) or f"{self.AUTH}/about-you")
-                self._log(f"验证成功 {describe_flow_state(next_state)}")
-                return (True, next_state) if return_state else (True, "验证成功")
-            else:
+
+        def _is_transient_error(err: Exception) -> bool:
+            text = str(err).lower()
+            keywords = (
+                "curl: (35)",
+                "tls",
+                "ssl",
+                "connection reset",
+                "connection closed",
+                "recv failure",
+                "timed out",
+                "timeout",
+                "temporarily unavailable",
+            )
+            return any(k in text for k in keywords)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    self._log(f"OTP 校验重试 {attempt + 1}/{max_retries}...")
+                    time.sleep(0.8 * attempt)
+
+                self._browser_pause()
+                r = self._request_with_retry("POST", url, json=payload, headers=headers, timeout=30)
+
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {}
+                    next_state = self._state_from_payload(data, current_url=str(r.url) or f"{self.AUTH}/about-you")
+                    self._log(f"验证成功 {describe_flow_state(next_state)}")
+                    return (True, next_state) if return_state else (True, "验证成功")
+
                 error_msg = r.text[:200]
+                if r.status_code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                    self._log(f"验证返回 {r.status_code}，视为临时错误，准备重试")
+                    continue
+
                 self._log(f"验证失败: {r.status_code} - {error_msg}")
                 return False, f"HTTP {r.status_code}"
-                
-        except Exception as e:
-            self._log(f"验证异常: {e}")
-            return False, str(e)
+
+            except Exception as e:
+                if _is_transient_error(e) and attempt < max_retries - 1:
+                    self._log(f"验证异常(可重试): {e}")
+                    continue
+                self._log(f"验证异常: {e}")
+                return False, str(e)
+
+        return False, "OTP 校验重试后仍失败"
     
     def create_account(self, first_name, last_name, birthdate, return_state=False):
         """
@@ -670,59 +882,83 @@ class ChatGPTClient:
         self._log(f"完成账号创建: {name}")
         url = f"{self.AUTH}/api/accounts/create_account"
 
-        sentinel_token = build_sentinel_token(
-            self.session,
-            self.device_id,
-            flow="authorize_continue",
-            user_agent=self.ua,
-            sec_ch_ua=self.sec_ch_ua,
-            impersonate=self.impersonate,
-        )
-        if sentinel_token:
-            self._log("create_account: 已生成 sentinel token")
-        else:
-            self._log("create_account: 未生成 sentinel token，降级继续请求")
-        
-        headers = self._headers(
-            url,
-            accept="application/json",
-            referer=f"{self.AUTH}/about-you",
-            origin=self.AUTH,
-            content_type="application/json",
-            fetch_site="same-origin",
-            extra_headers={
-                "oai-device-id": self.device_id,
-            },
-        )
-        if sentinel_token:
-            headers["openai-sentinel-token"] = sentinel_token
-        headers.update(generate_datadog_trace())
-        
         payload = {
             "name": name,
             "birthdate": birthdate,
         }
-        
-        try:
-            self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
-            
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    data = {}
-                next_state = self._state_from_payload(data, current_url=str(r.url) or self.BASE)
-                self._log(f"账号创建成功 {describe_flow_state(next_state)}")
-                return (True, next_state) if return_state else (True, "账号创建成功")
+
+        # create_account 是高频网络失败点，增加外层兜底重试，避免整流程直接失败
+        max_attempts = 3
+        last_error = None
+
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                self._log(f"create_account 外层重试 {attempt + 1}/{max_attempts}...")
+
+            sentinel_token = build_sentinel_token(
+                self.session,
+                self.device_id,
+                flow="authorize_continue",
+                user_agent=self.ua,
+                sec_ch_ua=self.sec_ch_ua,
+                impersonate=self.impersonate,
+            )
+            if sentinel_token:
+                self._log("create_account: 已生成 sentinel token")
             else:
+                self._log("create_account: 未生成 sentinel token，降级继续请求")
+
+            headers = self._headers(
+                url,
+                accept="application/json",
+                referer=f"{self.AUTH}/about-you",
+                origin=self.AUTH,
+                content_type="application/json",
+                fetch_site="same-origin",
+                extra_headers={
+                    "oai-device-id": self.device_id,
+                    "Connection": "close",
+                },
+            )
+            if sentinel_token:
+                headers["openai-sentinel-token"] = sentinel_token
+            headers.update(generate_datadog_trace())
+
+            try:
+                self._browser_pause()
+                r = self._request_with_retry(
+                    "POST",
+                    url,
+                    max_retries=5,
+                    json=payload,
+                    headers=headers,
+                    timeout=45,
+                )
+
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {}
+                    next_state = self._state_from_payload(data, current_url=str(r.url) or self.BASE)
+                    self._log(f"账号创建成功 {describe_flow_state(next_state)}")
+                    return (True, next_state) if return_state else (True, "账号创建成功")
+
                 error_msg = r.text[:200]
                 self._log(f"创建失败: {r.status_code} - {error_msg}")
                 return False, f"HTTP {r.status_code}"
-                
-        except Exception as e:
-            self._log(f"创建异常: {e}")
-            return False, str(e)
+
+            except Exception as e:
+                last_error = e
+                if self._is_retryable_network_error(e) and attempt < max_attempts - 1:
+                    self._log(f"创建异常(可重试): {e}")
+                    time.sleep(1.0 + attempt)
+                    continue
+                self._log(f"创建异常: {e}")
+                return False, str(e)
+
+        self._log(f"创建异常: {last_error}")
+        return False, str(last_error or "create_account 重试后仍失败")
     
     def register_complete_flow(self, email, password, first_name, last_name, birthdate, skymail_client):
         """
@@ -795,6 +1031,7 @@ class ChatGPTClient:
         register_submitted = False
         otp_verified = False
         account_created = False
+        otp_sent_at = None
         seen_states = {}
 
         for _ in range(12):
@@ -816,6 +1053,7 @@ class ChatGPTClient:
                 if not success:
                     return False, f"注册失败: {msg}"
                 register_submitted = True
+                otp_sent_at = time.time()
                 if not self.send_email_otp():
                     self._log("发送验证码接口返回失败，继续等待邮箱中的验证码...")
                 state = self._state_from_url(f"{self.AUTH}/email-verification")
@@ -823,16 +1061,38 @@ class ChatGPTClient:
 
             if self._state_is_email_otp(state):
                 self._log("等待邮箱验证码...")
-                otp_code = skymail_client.wait_for_verification_code(email, timeout=90)
-                if not otp_code:
-                    return False, "未收到验证码"
+                otp_max_attempts = 3
+                otp_last_error = "验证码失败"
+                for otp_attempt in range(otp_max_attempts):
+                    if otp_attempt > 0:
+                        self._log(f"OTP 重新尝试 {otp_attempt + 1}/{otp_max_attempts}...")
+                        otp_sent_at = time.time()
+                        self.send_email_otp()
 
-                success, next_state = self.verify_email_otp(otp_code, return_state=True)
-                if not success:
-                    return False, f"验证码失败: {next_state}"
-                otp_verified = True
-                state = next_state
-                self.last_registration_state = state
+                    otp_code = skymail_client.wait_for_verification_code(
+                        email,
+                        timeout=30,
+                        otp_sent_at=otp_sent_at,
+                    )
+                    if not otp_code:
+                        otp_last_error = "未收到验证码"
+                        continue
+
+                    success, next_state = self.verify_email_otp(otp_code, return_state=True)
+                    if success:
+                        otp_verified = True
+                        state = next_state
+                        self.last_registration_state = state
+                        break
+
+                    otp_last_error = str(next_state)
+                    if "wrong_email_otp_code" in otp_last_error or "HTTP 401" in otp_last_error:
+                        self._log("检测到 OTP 无效，准备请求新验证码后重试")
+                        continue
+                    return False, f"验证码失败: {otp_last_error}"
+
+                if not otp_verified:
+                    return False, f"验证码失败: {otp_last_error}"
                 continue
 
             if self._state_is_about_you(state):

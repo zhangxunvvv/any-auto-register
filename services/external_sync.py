@@ -75,6 +75,24 @@ def sync_account(account) -> list[dict[str, Any]]:
             )
             results.append({"name": "Sub2API", "ok": ok, "msg": msg})
 
+        sub2api_url = str(config_store.get("sub2api_api_url", "") or "").strip()
+        if sub2api_url:
+            from platforms.chatgpt.cpa_upload import upload_to_sub2api
+
+            class _B:
+                pass
+
+            b = _B()
+            b.email = account.email
+            extra = account.extra or {}
+            b.access_token = extra.get("access_token") or account.token
+            b.refresh_token = extra.get("refresh_token", "")
+            b.id_token = extra.get("id_token", "")
+            b.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
+
+            ok, msg = upload_to_sub2api(b)
+            results.append({"name": "sub2api", "ok": ok, "msg": msg})
+
     elif platform == "grok":
         grok2api_url = str(config_store.get("grok2api_url", "") or "").strip()
         if grok2api_url:

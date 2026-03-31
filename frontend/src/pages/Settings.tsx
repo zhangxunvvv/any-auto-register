@@ -41,6 +41,11 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '本地 Solver (Camoufox)', value: 'local_solver' },
     { label: '手动', value: 'manual' },
   ],
+  luckmail_mode: [
+    { label: '自动（ChatGPT=购买，其他=接码）', value: 'auto' },
+    { label: '强制购买邮箱', value: 'purchase' },
+    { label: '强制订单接码', value: 'order' },
+  ],
   cpa_cleanup_enabled: [
     { label: '关闭', value: '0' },
     { label: '开启', value: '1' },
@@ -145,11 +150,12 @@ const TAB_ITEMS = [
       },
       {
         title: 'LuckMail',
-        desc: 'ChatGPT 走购买邮箱，其他平台继续走订单接码老逻辑',
+        desc: '支持模式切换：自动 / 强制购买 / 强制接码（建议使用 ms_graph / ms_imap，留空自动选择）',
         fields: [
           { key: 'luckmail_base_url', label: '平台地址', placeholder: 'https://mails.luckyous.com' },
           { key: 'luckmail_api_key', label: 'API Key', secret: true },
-          { key: 'luckmail_email_type', label: '邮箱类型（可选）', placeholder: 'ms_graph / ms_imap / self_built' },
+          { key: 'luckmail_mode', label: '邮箱模式', type: 'select' },
+          { key: 'luckmail_email_type', label: '邮箱类型（可选）', placeholder: 'ms_graph / ms_imap（留空=自动）' },
           { key: 'luckmail_domain', label: '邮箱域名（可选）', placeholder: 'outlook.com / gmail.com' },
         ],
       },
@@ -208,6 +214,15 @@ const TAB_ITEMS = [
         fields: [
           { key: 'team_manager_url', label: 'API URL', placeholder: 'https://your-tm.example.com' },
           { key: 'team_manager_key', label: 'API Key', secret: true },
+        ],
+      },
+      {
+        title: 'sub2api',
+        desc: '注册完成后自动导入到 sub2api 管理后台',
+        fields: [
+          { key: 'sub2api_api_url', label: 'API URL', placeholder: 'http://127.0.0.1:8089' },
+          { key: 'sub2api_api_key', label: 'API Key', secret: true },
+          { key: 'sub2api_import_path', label: '导入路径', placeholder: '/api/v1/admin/accounts/data' },
         ],
       },
       {
@@ -777,6 +792,9 @@ export default function Settings() {
       }
       if (!data.luckmail_base_url) {
         data.luckmail_base_url = 'https://mails.luckyous.com/'
+      }
+      if (!data.luckmail_mode) {
+        data.luckmail_mode = 'auto'
       }
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)

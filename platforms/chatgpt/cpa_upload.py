@@ -5,7 +5,7 @@ CPA (Codex Protocol API) 上传功能
 import json
 import base64
 import logging
-from typing import Tuple
+from typing import Tuple, Any
 from datetime import datetime, timezone, timedelta
 import hashlib
 
@@ -190,6 +190,257 @@ def generate_token_json(account) -> dict:
         "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
         "refresh_token": refresh_token,
     }
+
+
+_DEFAULT_SUB2API_MODEL_MAPPING = {
+    "gpt-5-codex-mini": "gpt-5-codex-mini",
+    "gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
+    "gpt-5.2": "gpt-5.2",
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.1-codex-max": "gpt-5.1-codex-max",
+    "gpt-5.3-codex": "gpt-5.3-codex",
+    "gpt-5.1": "gpt-5.1",
+    "gpt-5.1-codex": "gpt-5.1-codex",
+    "gpt-5-codex": "gpt-5-codex",
+    "gpt-5.2-codex": "gpt-5.2-codex",
+    "gpt-5.4": "gpt-5.4",
+}
+
+
+def generate_sub2api_export(account, *, proxy_url: str = "", name: str = "") -> dict[str, Any]:
+    """将单个账号转换为 sub2api 导出文件格式（可直接保存为 JSON）。"""
+    email = str(getattr(account, "email", "") or "").strip()
+    access_token = str(getattr(account, "access_token", "") or "").strip()
+    refresh_token = str(getattr(account, "refresh_token", "") or "").strip()
+    id_token = str(getattr(account, "id_token", "") or "").strip()
+    if access_token and not id_token:
+        id_token = _build_compat_id_token(access_token=access_token, email=email)
+
+    payload = _decode_jwt_payload(access_token) if access_token else {}
+    auth_info = _get_auth_info(payload)
+
+    chatgpt_account_id = str(
+        auth_info.get("chatgpt_account_id")
+        or auth_info.get("account_id")
+        or ""
+    ).strip()
+    chatgpt_user_id = str(
+        auth_info.get("chatgpt_user_id")
+        or auth_info.get("user_id")
+        or payload.get("sub")
+        or ""
+    ).strip()
+    organization_id = str(auth_info.get("organization_id") or "").strip()
+    plan_type = str(auth_info.get("chatgpt_plan_type") or "free").strip() or "free"
+    expires_at = payload.get("exp") if isinstance(payload.get("exp"), int) else 0
+
+    credentials = {
+        "access_token": access_token,
+        "chatgpt_account_id": chatgpt_account_id,
+        "chatgpt_user_id": chatgpt_user_id,
+        "client_id": str(getattr(account, "client_id", "") or "app_EMoamEEZ73f0CkXaXp7hrann"),
+        "email": email,
+        "expires_at": int(expires_at or 0),
+        "id_token": id_token,
+        "model_mapping": dict(_DEFAULT_SUB2API_MODEL_MAPPING),
+        "organization_id": organization_id,
+        "plan_type": plan_type,
+        "refresh_token": refresh_token,
+    }
+
+    account_name = str(name or email.split("@", 1)[0] or "account").strip()
+    sub2api_account = {
+        "name": account_name,
+        "platform": "openai",
+        "type": "oauth",
+        "credentials": credentials,
+        "extra": {
+            "email": email,
+            "privacy_mode": "training_off",
+            "openai_oauth_responses_websockets_v2_enabled": False,
+            "openai_oauth_responses_websockets_v2_mode": "off",
+        },
+        "proxy_key": "",
+        "concurrency": 10,
+        "priority": 1,
+        "rate_multiplier": 1,
+        "auto_pause_on_expired": True,
+    }
+
+    proxies = []
+    if proxy_url:
+        protocol = "http"
+        host = ""
+        port = 0
+        try:
+            normalized = proxy_url.strip()
+            if "://" in normalized:
+                protocol, normalized = normalized.split("://", 1)
+            auth, _, hostport = normalized.rpartition("@")
+            target = hostport if hostport else auth
+            if ":" in target:
+                host, port_text = target.rsplit(":", 1)
+                port = int(port_text)
+            else:
+                host = target
+            proxy_key = f"{protocol}|{host}|{port}||"
+            proxies.append(
+                {
+                    "proxy_key": proxy_key,
+                    "name": "default",
+                    "protocol": protocol,
+                    "host": host,
+                    "port": port,
+                    "status": "active",
+                }
+            )
+            sub2api_account["proxy_key"] = proxy_key
+        except Exception:
+            pass
+
+    return {
+        "exported_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "proxies": proxies,
+        "accounts": [sub2api_account],
+    }
+
+
+def upload_to_sub2api(
+    account,
+    api_url: str = None,
+    api_key: str = None,
+    import_path: str = None,
+    proxy_url: str = "",
+) -> Tuple[bool, str]:
+    """上传单账号到 sub2api（优先 JSON 直传，失败时回退到 multipart file 上传）。"""
+    if not api_url:
+        api_url = _get_config_value("sub2api_api_url")
+    if not api_key:
+        api_key = _get_config_value("sub2api_api_key")
+    if not import_path:
+        import_path = _get_config_value("sub2api_import_path") or "/api/v1/admin/accounts/data"
+
+    api_url = str(api_url or "").strip()
+    import_path = "/" + str(import_path or "").strip().lstrip("/")
+    if not api_url:
+        return False, "sub2api API URL 未配置"
+
+    url = api_url.rstrip("/") + import_path
+    payload = generate_sub2api_export(account, proxy_url=proxy_url)
+    request_body = {
+        "data": payload,
+        "skip_default_group_bind": True,
+    }
+    auth_headers_list = [{}]
+    if api_key:
+        key = str(api_key).strip()
+        auth_headers_list = [
+            {"X-API-Key": key},
+            {"Authorization": f"Bearer {key}"},
+            {"Authorization": key},
+            {"api-key": key},
+        ]
+
+    last_error = "上传失败"
+    for auth_headers in auth_headers_list:
+        headers = {"Content-Type": "application/json", **auth_headers}
+        try:
+            resp = cffi_requests.post(
+                url,
+                headers=headers,
+                json=request_body,
+                proxies=None,
+                verify=False,
+                timeout=30,
+                impersonate="chrome110",
+            )
+            if resp.status_code in (200, 201):
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict) and data.get("code") not in (None, 0):
+                        last_error = data.get("message") or f"上传失败: code={data.get('code')}"
+                        if "invalid token" in str(last_error).lower():
+                            continue
+                        return False, str(last_error)
+                except Exception:
+                    pass
+                return True, "上传成功"
+
+            msg = f"上传失败: HTTP {resp.status_code}"
+            try:
+                detail = resp.json()
+                if isinstance(detail, dict):
+                    msg = detail.get("message") or detail.get("error") or msg
+            except Exception:
+                msg = f"{msg} - {resp.text[:200]}"
+            last_error = msg
+
+            low = str(msg).lower()
+            if resp.status_code in (401, 403) or "invalid token" in low:
+                continue
+            if resp.status_code not in (404, 405, 415):
+                return False, msg
+        except Exception as e:
+            last_error = f"上传异常: {e}"
+            # 继续尝试下一个鉴权头
+            continue
+
+    mime = None
+    try:
+        file_content = json.dumps(request_body, ensure_ascii=False, indent=2).encode("utf-8")
+        filename = f"{str(getattr(account, 'email', '') or 'account')}.sub2api.json"
+        mime = CurlMime()
+        mime.addpart(
+            name="file",
+            data=file_content,
+            filename=filename,
+            content_type="application/json",
+        )
+        for auth_headers in auth_headers_list:
+            headers2 = {k: v for k, v in auth_headers.items() if k.lower() != "content-type"}
+            resp = cffi_requests.post(
+                url,
+                multipart=mime,
+                headers=headers2,
+                proxies=None,
+                verify=False,
+                timeout=30,
+                impersonate="chrome110",
+            )
+            if resp.status_code in (200, 201):
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict) and data.get("code") not in (None, 0):
+                        msg = data.get("message") or f"上传失败: code={data.get('code')}"
+                        if "invalid token" in str(msg).lower():
+                            last_error = msg
+                            continue
+                        return False, msg
+                except Exception:
+                    pass
+                return True, "上传成功"
+
+            msg = f"上传失败: HTTP {resp.status_code}"
+            try:
+                detail = resp.json()
+                if isinstance(detail, dict):
+                    msg = detail.get("message") or detail.get("error") or msg
+            except Exception:
+                msg = f"{msg} - {resp.text[:200]}"
+            last_error = msg
+
+            low = str(msg).lower()
+            if resp.status_code in (401, 403) or "invalid token" in low:
+                continue
+            return False, msg
+
+        return False, str(last_error)
+    except Exception as e:
+        logger.error(f"sub2api 上传异常: {e}")
+        return False, f"上传异常: {e}"
+    finally:
+        if mime:
+            mime.close()
 
 
 def upload_to_cpa(

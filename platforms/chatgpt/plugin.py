@@ -201,6 +201,7 @@ class ChatGPTPlatform(BasePlatform):
                 "params": [
                     {"key": "api_url", "label": "Sub2API API URL", "type": "text"},
                     {"key": "api_key", "label": "Sub2API API Key", "type": "text"},
+                    {"key": "import_path", "label": "导入路径", "type": "text"},
                 ],
             },
             {
@@ -324,6 +325,17 @@ class ChatGPTPlatform(BasePlatform):
                     api_url=params.get("api_url"),
                     api_key=params.get("api_key"),
                 )
+            return {"ok": ok, "data": msg}
+
+        elif action_id == "upload_sub2api":
+            from platforms.chatgpt.cpa_upload import upload_to_sub2api
+            ok, msg = upload_to_sub2api(
+                a,
+                api_url=params.get("api_url"),
+                api_key=params.get("api_key"),
+                import_path=params.get("import_path"),
+                proxy_url=proxy or "",
+            )
             return {"ok": ok, "data": msg}
 
         raise NotImplementedError(f"未知操作: {action_id}")
