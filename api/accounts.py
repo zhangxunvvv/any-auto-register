@@ -89,6 +89,7 @@ def get_stats(session: Session = Depends(get_session)):
 def export_accounts(
     platform: Optional[str] = None,
     status: Optional[str] = None,
+    format: Optional[str] = "csv",
     session: Session = Depends(get_session),
 ):
     q = select(AccountModel)
@@ -97,6 +98,29 @@ def export_accounts(
     if status:
         q = q.where(AccountModel.status == status)
     accounts = session.exec(q).all()
+
+    if format == "json":
+        data = []
+        for acc in accounts:
+            item = {
+                "platform": acc.platform,
+                "email": acc.email,
+                "password": acc.password,
+                "user_id": acc.user_id,
+                "region": acc.region,
+                "token": acc.token,
+                "status": acc.status,
+                "cashier_url": acc.cashier_url,
+                "extra": acc.get_extra(),
+                "created_at": acc.created_at.strftime("%Y-%m-%d %H:%M:%S") if acc.created_at else "",
+            }
+            data.append(item)
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=accounts.json"},
+        )
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -178,6 +202,22 @@ def batch_delete_accounts(
         session.rollback()
         logger.exception("批量删除失败")
         raise HTTPException(500, f"批量删除失败: {str(e)}")
+
+
+@router.delete("/all")
+def delete_all_accounts(
+    platform: str,
+    session: Session = Depends(get_session),
+):
+    """删除指定平台的全部账号"""
+    q = select(AccountModel).where(AccountModel.platform == platform)
+    accounts = session.exec(q).all()
+    count = len(accounts)
+    for acc in accounts:
+        session.delete(acc)
+    session.commit()
+    logger.info(f"删除 {platform} 全部账号: {count} 个")
+    return {"deleted": count}
 
 
 @router.post("/check-all")

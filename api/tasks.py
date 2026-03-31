@@ -73,18 +73,62 @@ def _save_task_log(platform: str, email: str, status: str,
         s.commit()
 
 
-def _auto_upload_integrations(task_id: str, account):
+def _auto_upload_integrations(task_id: str, account, skip_sub2api: bool = False):
     """注册成功后自动导入外部系统。"""
     try:
         from services.external_sync import sync_account
 
-        for result in sync_account(account):
+        for result in sync_account(account, skip_sub2api=skip_sub2api):
             name = result.get("name", "Auto Upload")
             ok = bool(result.get("ok"))
             msg = result.get("msg", "")
             _log(task_id, f"  [{name}] {'✓ ' + msg if ok else '✗ ' + msg}")
     except Exception as e:
         _log(task_id, f"  [Auto Upload] 自动导入异常: {e}")
+
+
+def _sub_upload_one(task_id: str, db_account, group_id=None):
+    """将单个已保存的 DB 账号同步到 Sub2API。"""
+    _sub_upload_many(task_id, [db_account], group_id=group_id)
+
+
+def _sub_upload_many(task_id: str, db_accounts, group_id=None):
+    """将多个已保存的 DB 账号批量同步到 Sub2API。"""
+    if not db_accounts:
+        return
+    try:
+        from core.config_store import config_store
+        from services.sub2api_upload import upload_to_sub2api, _search_remote_account, _update_remote_groups, _map_platform
+
+        api_url = str(config_store.get("sub2api_url", "") or "").strip()
+        api_key = str(config_store.get("sub2api_key", "") or "").strip()
+        if not api_url or not api_key:
+            _log(task_id, "  [Sub2API] ✗ 未配置 Sub2API URL 或 Key")
+            return
+
+        ok, msg = upload_to_sub2api(list(db_accounts), api_url, api_key)
+        if ok:
+            _log(task_id, f"  [Sub2API] ✓ 上传 {len(db_accounts)} 个: {msg}")
+            if group_id:
+                for db_acc in db_accounts:
+                    remote = _search_remote_account(api_url, api_key, db_acc.email, _map_platform(db_acc.platform))
+                    if remote:
+                        existing_ids = []
+                        for v in remote.get("group_ids") or []:
+                            try:
+                                existing_ids.append(int(v))
+                            except (TypeError, ValueError):
+                                pass
+                        merged = sorted(set(existing_ids + [int(group_id)]))
+                        bind_ok, bind_msg = _update_remote_groups(api_url, api_key, int(remote["id"]), merged)
+                        if bind_ok:
+                            _log(task_id, f"  [Sub2API] ✓ {db_acc.email} 已绑定分组")
+                        else:
+                            _log(task_id, f"  [Sub2API] ✗ {db_acc.email} 分组绑定失败: {bind_msg}")
+        else:
+            _log(task_id, f"  [Sub2API] ✗ {msg}")
+    except Exception as e:
+        _log(task_id, f"  [Sub2API] ✗ 上传异常: {e}")
 
 
 def _run_register(task_id: str, req: RegisterTaskRequest):
@@ -99,6 +143,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     errors = []
     start_gate_lock = threading.Lock()
     next_start_time = time.time()
+
+    # Sub2API "each" 模式的批量累积
+    sub_sync_batch_size = max(1, int(req.extra.get("sub_sync_batch_size", 1) or 1))
+    _sub_pending_lock = threading.Lock()
+    _sub_pending_emails: list[str] = []
 
     try:
         PlatformCls = get(req.platform)
@@ -172,7 +221,38 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if _proxy: proxy_pool.report_success(_proxy)
                 _log(task_id, f"✓ 注册成功: {account.email}")
                 _save_task_log(req.platform, account.email, "success")
-                _auto_upload_integrations(task_id, account)
+
+                # Sub2API 同步模式
+                sub_sync_mode = req.extra.get("sub_sync_mode", "none")
+                skip_sub2api = sub_sync_mode in ("each", "batch")
+                _auto_upload_integrations(task_id, account, skip_sub2api=skip_sub2api)
+
+                # 逐批上传模式
+                if sub_sync_mode == "each":
+                    flush_emails = []
+                    with _sub_pending_lock:
+                        _sub_pending_emails.append(account.email)
+                        if len(_sub_pending_emails) >= sub_sync_batch_size:
+                            flush_emails = list(_sub_pending_emails)
+                            _sub_pending_emails.clear()
+                    if flush_emails:
+                        from core.db import AccountModel, engine as _eng
+                        from sqlmodel import Session as _Sess, select as _sel
+                        with _Sess(_eng) as _s:
+                            db_accs = _s.exec(
+                                _sel(AccountModel)
+                                .where(AccountModel.platform == account.platform)
+                                .where(AccountModel.email.in_(flush_emails))
+                            ).all()
+                            if db_accs:
+                                sub_group_id = req.extra.get("sub_group_id")
+                                _sub_upload_many(task_id, db_accs, group_id=sub_group_id)
+
+                # 批量模式：收集已保存账号的 email
+                if sub_sync_mode == "batch":
+                    with _tasks_lock:
+                        _tasks[task_id].setdefault("_sub_batch_emails", []).append(account.email)
+
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _log(task_id, f"  [升级链接] {cashier_url}")
@@ -186,7 +266,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 return str(e)
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        max_workers = min(req.concurrency, req.count, 5)
+        max_workers = min(req.concurrency, req.count, 20)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_do_one, i) for i in range(req.count)]
             for f in as_completed(futures):
@@ -200,6 +280,28 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     success += 1
                 else:
                     errors.append(result)
+
+        # "each" 模式：刷新剩余未上传的账号
+        sub_sync_mode = req.extra.get("sub_sync_mode", "none")
+        if sub_sync_mode == "each":
+            with _sub_pending_lock:
+                remaining_emails = list(_sub_pending_emails)
+                _sub_pending_emails.clear()
+            if remaining_emails:
+                try:
+                    from core.db import AccountModel, engine as _eng
+                    from sqlmodel import Session as _Sess, select as _sel
+                    with _Sess(_eng) as _s:
+                        db_accs = _s.exec(
+                            _sel(AccountModel)
+                            .where(AccountModel.platform == req.platform)
+                            .where(AccountModel.email.in_(remaining_emails))
+                        ).all()
+                        if db_accs:
+                            sub_group_id = req.extra.get("sub_group_id")
+                            _sub_upload_many(task_id, db_accs, group_id=sub_group_id)
+                except Exception as e:
+                    _log(task_id, f"[Sub2API] ✗ 剩余批量上传异常: {e}")
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         with _tasks_lock:
@@ -212,6 +314,30 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _tasks[task_id]["success"] = success
         _tasks[task_id]["errors"] = errors
     _log(task_id, f"完成: 成功 {success} 个, 失败 {len(errors)} 个")
+
+    # 批量模式：注册全部完成后统一上传到 Sub2API
+    sub_sync_mode = req.extra.get("sub_sync_mode", "none")
+    if sub_sync_mode == "batch" and success > 0:
+        with _tasks_lock:
+            batch_emails = list(_tasks[task_id].get("_sub_batch_emails", []))
+        if batch_emails:
+            _log(task_id, f"[Sub2API] 开始批量上传 {len(batch_emails)} 个账号...")
+            try:
+                from core.db import AccountModel, engine as _eng
+                from sqlmodel import Session as _Sess, select as _sel
+
+                with _Sess(_eng) as _s:
+                    db_accs = _s.exec(
+                        _sel(AccountModel)
+                        .where(AccountModel.platform == req.platform)
+                        .where(AccountModel.email.in_(batch_emails))
+                    ).all()
+                if db_accs:
+                    sub_group_id = req.extra.get("sub_group_id")
+                    _sub_upload_many(task_id, db_accs, group_id=sub_group_id)
+            except Exception as e:
+                _log(task_id, f"[Sub2API] ✗ 批量上传异常: {e}")
+
     _cleanup_old_tasks()
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 
-def sync_account(account) -> list[dict[str, Any]]:
+def sync_account(account, skip_sub2api: bool = False) -> list[dict[str, Any]]:
     """根据平台将账号同步到外部系统。"""
     from core.config_store import config_store
 
@@ -52,5 +52,29 @@ def sync_account(account) -> list[dict[str, Any]]:
         if configured_path or target_path.parent.exists() or target_path.exists():
             ok, msg = upload_to_kiro_manager(account, path=configured_path or None)
             results.append({"name": "Kiro Manager", "ok": ok, "msg": msg})
+
+    # Sub2API 自动同步（所有平台通用）
+    # 当注册任务指定了 sub_sync_mode=each/batch 时跳过自动同步，由任务自行处理
+    sub2api_url = str(config_store.get("sub2api_url", "") or "").strip()
+    sub2api_key = str(config_store.get("sub2api_key", "") or "").strip()
+    if sub2api_url and sub2api_key and not skip_sub2api:
+        try:
+            from core.db import AccountModel
+            from sqlmodel import Session, select
+            from core.db import engine as _engine
+            from services.sub2api_upload import upload_to_sub2api
+
+            with Session(_engine) as _s:
+                db_acc = _s.exec(
+                    select(AccountModel)
+                    .where(AccountModel.platform == platform)
+                    .where(AccountModel.email == str(getattr(account, "email", "")))
+                ).first()
+                if db_acc:
+                    target_type = str(config_store.get("sub2api_target_type", "sub2api") or "sub2api")
+                    ok, msg = upload_to_sub2api([db_acc], sub2api_url, sub2api_key, target_type=target_type)
+                    results.append({"name": "Sub2API", "ok": ok, "msg": msg})
+        except Exception as exc:
+            results.append({"name": "Sub2API", "ok": False, "msg": str(exc)})
 
     return results

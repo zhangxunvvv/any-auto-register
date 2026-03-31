@@ -26,6 +26,8 @@ export default function Register() {
   const [form] = Form.useForm()
   const [task, setTask] = useState<any>(null)
   const [polling, setPolling] = useState(false)
+  const [subGroups, setSubGroups] = useState<any[]>([])
+  const [subGroupsLoading, setSubGroupsLoading] = useState(false)
 
   useEffect(() => {
     apiFetch('/config').then((cfg) => {
@@ -73,6 +75,9 @@ export default function Register() {
         captcha_solver: values.captcha_solver,
         extra: {
           mail_provider: values.mail_provider,
+          sub_sync_mode: values.sub_sync_mode || 'none',
+          sub_group_id: values.sub_group_id || null,
+          sub_sync_batch_size: values.sub_sync_batch_size || 1,
           laoudo_auth: values.laoudo_auth,
           laoudo_email: values.laoudo_email,
           laoudo_account_id: values.laoudo_account_id,
@@ -119,7 +124,25 @@ export default function Register() {
   const mailProvider = Form.useWatch('mail_provider', form)
   const captchaSolver = Form.useWatch('captcha_solver', form)
   const platform = Form.useWatch('platform', form)
+  const subSyncMode = Form.useWatch('sub_sync_mode', form)
   const executorOptions = getExecutorOptions(platform)
+
+  const fetchSubGroups = async () => {
+    setSubGroupsLoading(true)
+    setSubGroups([])
+    form.setFieldValue('sub_group_id', undefined)
+    try {
+      const res = await apiFetch('/integrations/sub2api/groups')
+      const groups = res.groups || []
+      setSubGroups(groups)
+      if (groups.length > 0) form.setFieldValue('sub_group_id', groups[0].id)
+    } catch { /* ignore */ }
+    finally { setSubGroupsLoading(false) }
+  }
+
+  useEffect(() => {
+    if (subSyncMode && subSyncMode !== 'none') fetchSubGroups()
+  }, [subSyncMode])
 
   useEffect(() => {
     const currentExecutor = form.getFieldValue('executor_type')
@@ -144,6 +167,7 @@ export default function Register() {
         count: 1,
         register_delay_seconds: 0,
         solver_url: 'http://localhost:8889',
+        sub_sync_mode: 'none',
       }}>
         <Card title="基本配置" style={{ marginBottom: 16 }}>
           <Form.Item name="platform" label="平台" rules={[{ required: true }]}>
@@ -173,7 +197,7 @@ export default function Register() {
           </Form.Item>
           <Space style={{ width: '100%' }}>
             <Form.Item name="count" label="批量数量" style={{ flex: 1 }}>
-              <Input type="number" min={1} />
+              <InputNumber min={1} style={{ width: '100%' }} />
             </Form.Item>
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" style={{ flex: 1 }}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0" />
@@ -265,6 +289,42 @@ export default function Register() {
             </Text>
           </Card>
         )}
+
+        <Card title="Sub2API 同步" style={{ marginBottom: 16 }}>
+          <Form.Item name="sub_sync_mode" label="同步模式">
+            <Select
+              options={[
+                { value: 'none', label: '不同步' },
+                { value: 'each', label: '每 N 个上传' },
+                { value: 'batch', label: '注册完毕后统一上传' },
+              ]}
+            />
+          </Form.Item>
+          {subSyncMode === 'each' && (
+            <Form.Item name="sub_sync_batch_size" label="每注册成功几个上传一次" initialValue={1}>
+              <InputNumber min={1} style={{ width: '100%' }} placeholder="默认 1，即每成功 1 个就上传" />
+            </Form.Item>
+          )}
+          {subSyncMode && subSyncMode !== 'none' && (
+            <Form.Item name="sub_group_id" label="目标分组">
+              <Select
+                placeholder={subGroupsLoading ? '正在拉取分组...' : '选择分组（可选）'}
+                loading={subGroupsLoading}
+                allowClear
+                options={subGroups.map((g: any) => ({
+                  value: g.id,
+                  label: `${g.name}${g.account_count != null ? ` (${g.account_count} 个账号)` : ''}`,
+                }))}
+              />
+            </Form.Item>
+          )}
+          {subSyncMode && subSyncMode !== 'none' && (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {subSyncMode === 'each' ? '每注册成功指定数量后上传到 Sub2API' : '所有注册完成后批量上传到 Sub2API'}
+              。请确保已在设置中配置 Sub2API URL 和 Key。
+            </Text>
+          )}
+        </Card>
 
         <Button type="primary" htmlType="submit" block disabled={polling} icon={polling ? <LoadingOutlined /> : <PlayCircleOutlined />}>
           {polling ? '注册中...' : '开始注册'}

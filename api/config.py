@@ -19,6 +19,7 @@ CONFIG_KEYS = [
     "cliproxyapi_management_key",
     "grok2api_url", "grok2api_app_key", "grok2api_pool", "grok2api_quota",
     "kiro_manager_path", "kiro_manager_exe",
+    "sub2api_url", "sub2api_key", "sub2api_target_type", "sub2api_default_group_id",
 ]
 
 

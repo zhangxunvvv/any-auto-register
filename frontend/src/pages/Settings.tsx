@@ -211,6 +211,23 @@ const TAB_ITEMS = [
     ],
   },
   {
+    key: 'sub2api',
+    label: 'Sub2API',
+    icon: <ApiOutlined />,
+    sections: [
+      {
+        title: 'Sub2API / NewAPI',
+        desc: '将账号同步到 Sub2API 或 NewAPI 平台，支持一键批量导入',
+        fields: [
+          { key: 'sub2api_url', label: 'API URL', placeholder: 'https://your-sub2api.example.com' },
+          { key: 'sub2api_key', label: 'API Key', secret: true },
+          { key: 'sub2api_target_type', label: '目标类型（可选）', placeholder: 'sub2api 或 newapi，默认 sub2api' },
+          { key: 'sub2api_default_group_id', label: '默认分组 ID（可选）', placeholder: '上传后自动绑定到该分组' },
+        ],
+      },
+    ],
+  },
+  {
     key: 'integrations',
     label: '插件',
     icon: <ApiOutlined />,

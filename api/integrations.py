@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
@@ -15,6 +15,20 @@ router = APIRouter(prefix="/integrations", tags=["integrations"])
 
 class BackfillRequest(BaseModel):
     platforms: list[str] = Field(default_factory=lambda: ["grok", "kiro"])
+
+
+class Sub2APISyncRequest(BaseModel):
+    account_ids: List[int] = Field(default_factory=list)
+    platform: Optional[str] = None
+    group_id: Optional[int] = None
+    concurrency: int = 3
+    priority: int = 50
+    target_type: str = "sub2api"
+
+
+class Sub2APITestRequest(BaseModel):
+    api_url: str
+    api_key: str
 
 
 def _to_account(model: AccountModel) -> Account:
@@ -120,3 +134,77 @@ def backfill_integrations(body: BackfillRequest):
         summary["total"] += 1
 
     return summary
+
+
+# ── Sub2API 集成 ──────────────────────────────────────────
+
+@router.post("/sub2api/test")
+def test_sub2api(body: Sub2APITestRequest):
+    """测试 Sub2API 连接"""
+    from services.sub2api_upload import test_sub2api_connection
+
+    ok, msg = test_sub2api_connection(body.api_url, body.api_key)
+    return {"ok": ok, "message": msg}
+
+
+@router.get("/sub2api/groups")
+def get_sub2api_groups(platform: str = "openai"):
+    """拉取 Sub2API 分组列表"""
+    from core.config_store import config_store
+    from services.sub2api_upload import fetch_sub2api_groups
+
+    api_url = str(config_store.get("sub2api_url", "") or "").strip()
+    api_key = str(config_store.get("sub2api_key", "") or "").strip()
+    if not api_url or not api_key:
+        raise HTTPException(400, "Sub2API URL 或 API Key 未配置")
+
+    ok, msg, groups = fetch_sub2api_groups(api_url, api_key, platform)
+    return {"ok": ok, "message": msg, "groups": groups}
+
+
+@router.post("/sub2api/sync")
+def sync_to_sub2api(body: Sub2APISyncRequest):
+    """
+    同步账号到 Sub2API。
+    - 传 account_ids: 同步指定账号
+    - 传 platform 且不传 account_ids: 同步该平台所有账号
+    """
+    from core.config_store import config_store
+    from services.sub2api_upload import batch_sync_to_sub2api, sync_all_platform_to_sub2api
+
+    api_url = str(config_store.get("sub2api_url", "") or "").strip()
+    api_key = str(config_store.get("sub2api_key", "") or "").strip()
+    if not api_url or not api_key:
+        raise HTTPException(400, "Sub2API URL 或 API Key 未配置")
+
+    group_id = body.group_id
+    if group_id is None:
+        raw = config_store.get("sub2api_default_group_id", "")
+        if raw:
+            try:
+                group_id = int(raw)
+            except (TypeError, ValueError):
+                pass
+
+    target_type = body.target_type or str(config_store.get("sub2api_target_type", "sub2api") or "sub2api")
+
+    if body.account_ids:
+        result = batch_sync_to_sub2api(
+            body.account_ids, api_url, api_key,
+            group_id=group_id,
+            concurrency=body.concurrency,
+            priority=body.priority,
+            target_type=target_type,
+        )
+    elif body.platform:
+        result = sync_all_platform_to_sub2api(
+            body.platform, api_url, api_key,
+            group_id=group_id,
+            concurrency=body.concurrency,
+            priority=body.priority,
+            target_type=target_type,
+        )
+    else:
+        raise HTTPException(400, "请指定 account_ids 或 platform")
+
+    return result
